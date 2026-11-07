@@ -1,8 +1,8 @@
 // =============================================================================
-// counter_probe.c — NIC counter 파일을 쉬지 않고 읽으면서 (ta, tb, value)를 기록
+// counter_probe_paced.c — 100us target paced counter sampling, no per-sample disk I/O
 //
-// 사용법:  counter_probe <counter_path> <cpu> <max_sec> <out.csv> [max_samples]
-//   예)    counter_probe /sys/class/net/enp65s0f0np0/statistics/tx_bytes 6 10 A_idle.csv
+// 사용법:  counter_probe_paced <counter_path> <cpu> <max_sec> <out.csv> [interval_us] [max_samples]
+//   예)    counter_probe_paced /sys/class/net/enp65s0f0np0/statistics/tx_bytes 6 120 A_tx.csv 100
 //
 // 종료:    max_sec가 지나거나, SIGINT(Ctrl+C)/SIGTERM을 받으면 기록을 CSV로 저장하고 끝남
 // 원칙:    probe는 raw 값만 정직하게 남긴다. 단위 변환(x4 등)과 rate 계산은 분석 단계에서.
@@ -90,16 +90,17 @@ static inline uint64_t now_ns(clockid_t clk) {
 int main(int argc, char **argv) {
     // ---------- [1] 인자 읽기 ----------
     if (argc < 5) {
-        fprintf(stderr, "usage: %s <counter_path> <cpu> <max_sec> <out.csv> [max_samples]\n", argv[0]);
+        fprintf(stderr, "usage: %s <counter_path> <cpu> <max_sec> <out.csv> [interval_us] [max_samples]\n", argv[0]);
         return 1;
     }
     const char *path = argv[1];
     const char *out  = argv[4];
     long cpu_l;
     double max_sec;
-    // 기본 buffer: 5천만 sample (sizeof(sample_t)=32 bytes 기준 약 1.6 GB). 한 번 읽는 데 0.5 µs여도 약 25초 분량.
+    // 기본 buffer: 2백만 sample (~64 MB). Target 100us이면 최대 200초 분량.
     // 측정 중에 buffer를 늘리면(realloc) 그 순간 지연이 생기므로, 처음에 크게 잡고 꽉 차면 경고한다.
-    uint64_t max_n = 50000000ull;
+    uint64_t max_n = 2000000ull;  // 64MB cap per probe; 100us for 120s needs ~1.2M samples
+    long interval_us = 100;
 
     long ncpu = sysconf(_SC_NPROCESSORS_CONF);
     if (!parse_long(argv[2], &cpu_l) || cpu_l < 0 || cpu_l >= ncpu || cpu_l >= CPU_SETSIZE_SAFE) {
@@ -108,7 +109,10 @@ int main(int argc, char **argv) {
     if (!parse_double(argv[3], &max_sec) || max_sec <= 0) {
         fprintf(stderr, "error: max_sec must be a positive number\n"); return 1;
     }
-    if (argc > 5 && (!parse_u64(argv[5], &max_n) || max_n == 0)) {
+    if (argc > 5 && (!parse_long(argv[5], &interval_us) || interval_us < 1 || interval_us > 1000000)) {
+        fprintf(stderr, "error: interval_us must be in [1, 1000000]\n"); return 1;
+    }
+    if (argc > 6 && (!parse_u64(argv[6], &max_n) || max_n == 0)) {
         fprintf(stderr, "error: max_samples must be a positive integer\n"); return 1;
     }
     if (max_n > SIZE_MAX / sizeof(sample_t)) {           // 곱셈 overflow 방지
@@ -153,7 +157,10 @@ int main(int argc, char **argv) {
     uint64_t mono0 = now_ns(CLOCK_MONOTONIC_RAW);
     uint64_t deadline = mono0 + (uint64_t)(max_sec * 1e9);
 
-    // ---------- [7] 측정 loop: ta → 읽기 → tb, 그 외의 일은 전부 bracket 밖에서 ----------
+    // ---------- [7] 측정 loop: MONOTONIC for sleeping, RAW for trace timestamps ----------
+    // Linux CLOCK_MONOTONIC is used only as the sleep scheduler; trace stays RAW.
+    uint64_t period_ns = (uint64_t)interval_us * 1000ull;
+    uint64_t next_wake_mono = now_ns(CLOCK_MONOTONIC);
     char buf[64];
     uint64_t n = 0, nfail = 0;
     const char *reason = "max_sec";
@@ -179,6 +186,13 @@ int main(int argc, char **argv) {
             p->ok = 0;
         }
         if (!p->ok) { p->val = 0; nfail++; }
+        // Avoid CPU-saturating busy polling. Missed schedules are not "caught up".
+        next_wake_mono += period_ns;
+        uint64_t cur_mono = now_ns(CLOCK_MONOTONIC);
+        if (cur_mono > next_wake_mono) next_wake_mono = cur_mono;
+        struct timespec wake = { .tv_sec = (time_t)(next_wake_mono / 1000000000ull),
+                                 .tv_nsec = (long)(next_wake_mono % 1000000000ull) };
+        while (!stop_flag && clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &wake, NULL) == EINTR) {}
     }
     uint64_t rt1   = now_ns(CLOCK_REALTIME);
     uint64_t mono1 = now_ns(CLOCK_MONOTONIC_RAW);
@@ -192,6 +206,7 @@ int main(int argc, char **argv) {
     // '#'로 시작하는 줄 = metadata (분석 코드가 읽어서 사용)
     fprintf(f, "# counter_path=%s\n", path);
     fprintf(f, "# cpu=%d\n", cpu);
+    fprintf(f, "# target_interval_us=%ld\n", interval_us);
     fprintf(f, "# clock=CLOCK_MONOTONIC_RAW, ta_ns/tb_ns are relative to anchor_start.mono_raw_ns\n");
     fprintf(f, "# anchor_start realtime_ns=%" PRIu64 " mono_raw_ns=%" PRIu64 "\n", rt0, mono0);
     fprintf(f, "# anchor_end realtime_ns=%" PRIu64 " mono_raw_ns=%" PRIu64 "\n", rt1, mono1);
